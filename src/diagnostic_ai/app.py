@@ -1,0 +1,472 @@
+# app.py - Streamlit UI for Diagnostic AI Agent
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Verify key is loaded
+if not os.getenv("GROQ_API_KEY"):
+    raise ValueError("❌ GROQ_API_KEY missing! Check your .env file path or spelling.")
+
+from io import BytesIO
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+
+import streamlit as st
+import json4
+from datetime import datetime
+from diagnostic_ai.agent.graph import diagnostic_graph, initialize_diagnostic_workflow
+from diagnostic_ai.data.patient_simulator import PatientDataSimulator
+from diagnostic_ai.rag.retriever import MedicalKnowledgeRAG
+from diagnostic_ai.utils.logger import AuditLogger
+from reportlab.lib.pagesizes import letter
+
+# Page configuration
+st.set_page_config(
+    page_title="Diagnostic AI Agent",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+def generate_pdf_report(patient, risk_assessment, alerts, final_state):
+    """Generate PDF report for diagnostic results"""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1E40AF'),
+        spaceAfter=30,
+    )
+    story.append(Paragraph("🏥 Diagnostic AI Report", title_style))
+    story.append(Spacer(1, 0.2*inch))
+    
+    # Patient Info
+    story.append(Paragraph(f"<b>Patient ID:</b> {patient.patient_id}", styles['Normal']))
+    story.append(Paragraph(f"<b>Age:</b> {patient.age} years", styles['Normal']))
+    story.append(Paragraph(f"<b>Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Vitals Table
+    story.append(Paragraph("<b>Vital Signs</b>", styles['Heading2']))
+    vitals_data = [
+        ['Metric', 'Value'],
+        ['Heart Rate', f"{patient.vitals['hr']} bpm"],
+        ['Blood Pressure', patient.vitals['bp']],
+        ['Temperature', f"{patient.vitals['temp']}°F"],
+        ['O2 Saturation', f"{patient.vitals['o2']}%"],
+        ['Respiratory Rate', f"{patient.vitals['rr']}/min"],
+    ]
+    vitals_table = Table(vitals_data)
+    vitals_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    story.append(vitals_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Lab Values
+    story.append(Paragraph("<b>Laboratory Results</b>", styles['Heading2']))
+    labs_data = [['Test', 'Result']]
+    for key, value in patient.recent_labs.items():
+        labs_data.append([key.title(), str(value)])
+    labs_table = Table(labs_data)
+    labs_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    story.append(labs_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Symptoms
+    story.append(Paragraph("<b>Reported Symptoms</b>", styles['Heading2']))
+    story.append(Paragraph(", ".join(patient.symptoms), styles['Normal']))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Alerts
+    if alerts:
+        story.append(Paragraph("<b>⚠️ Clinical Alerts</b>", styles['Heading2']))
+        alert_style = ParagraphStyle(
+            'Alert',
+            parent=styles['Normal'],
+            textColor=colors.red,
+            fontSize=11,
+        )
+        for alert in alerts:
+            story.append(Paragraph(alert.replace('\n', '<br/>'), alert_style))
+            story.append(Spacer(1, 0.2*inch))
+    
+    # Risk Assessment
+    story.append(Paragraph("<b>Risk Assessment</b>", styles['Heading2']))
+    assessment_text = risk_assessment.get('assessment', 'No assessment available')
+    story.append(Paragraph(assessment_text.replace('\n', '<br/>'), styles['Normal']))
+    
+    # Footer
+    story.append(Spacer(1, 0.5*inch))
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=colors.grey,
+    )
+    story.append(Paragraph(
+        "⚠️ This report is generated by AI for research/demo purposes only. "
+        "Not for clinical use without physician review.",
+        footer_style
+    ))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: #1E40AF;
+        margin-bottom: 1rem;
+    }
+    .alert-box {
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+        border-left: 4px solid;
+    }
+    .alert-high {
+        background-color: #FEE2E2;
+        border-color: #DC2626;
+    }
+    .alert-moderate {
+        background-color: #FEF3C7;
+        border-color: #F59E0B;
+    }
+    .alert-low {
+        background-color: #DBEAFE;
+        border-color: #3B82F6;
+    }
+    .metric-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+if 'final_state' not in st.session_state:
+    st.session_state.final_state = None
+if 'audit_logger' not in st.session_state:
+    st.session_state.audit_logger = AuditLogger("WebInterface")
+
+# Initialize RAG system (cache it)
+@st.cache_resource
+def initialize_rag():
+    """Initialize RAG system once"""
+    SAMPLE_MEDICAL_DOCS = [
+        """Acute Coronary Syndrome (ACS) Diagnostic Criteria:
+        - Chest pain or discomfort lasting >20 minutes
+        - Elevated cardiac biomarkers (troponin >0.04)
+        - ST-segment elevation or depression on ECG
+        - Risk factors: age, smoking, diabetes, hypertension
+        - Tachycardia, tachypnea, hypoxia may be present
+        - Immediate ECG and troponin measurement recommended""",
+        
+        """Sepsis Diagnostic Criteria (qSOFA):
+        - Suspected infection + 2 of following:
+        - Altered mental status (confusion)
+        - Respiratory distress (RR >22)
+        - Systolic BP <100 mmHg
+        - Fever (>100.4°F) or hypothermia (<96.8°F)
+        - Elevated lactate (>4 mmol/L)
+        - Urgent antibiotics and supportive care required""",
+    ]
+    rag = MedicalKnowledgeRAG()
+    rag.build_knowledge_base(SAMPLE_MEDICAL_DOCS)
+    return rag
+
+# Sidebar - Patient Input
+with st.sidebar:
+    st.markdown("### 🏥 Patient Data Input")
+    
+    input_mode = st.radio(
+        "Select Input Mode:",
+        ["Simulate Patient", "Manual Entry"],
+        help="Generate synthetic patient or enter real data"
+    )
+    
+    if input_mode == "Simulate Patient":
+        risk_profile = st.selectbox(
+            "Risk Profile:",
+            ["normal", "high_risk_acs", "high_risk_sepsis"],
+            help="Select patient risk level for simulation"
+        )
+        
+        if st.button("🎲 Generate Patient", type="primary", use_container_width=True):
+            patient = PatientDataSimulator.generate_patient_case(risk_profile)
+            st.session_state.patient = patient
+            st.session_state.analysis_complete = False
+            st.success(f"Patient {patient.patient_id} generated!")
+            st.rerun()
+    
+    else:
+        st.markdown("#### Manual Patient Data")
+        patient_id = st.text_input("Patient ID", "PT00001")
+        age = st.number_input("Age", min_value=1, max_value=120, value=65)
+        
+        st.markdown("**Vitals:**")
+        hr = st.number_input("Heart Rate (bpm)", value=72)
+        bp_sys = st.number_input("BP Systolic", value=120)
+        bp_dia = st.number_input("BP Diastolic", value=80)
+        temp = st.number_input("Temperature (°F)", value=98.6)
+        o2 = st.number_input("O2 Saturation (%)", value=98)
+        rr = st.number_input("Respiratory Rate", value=16)
+        
+        st.markdown("**Lab Values:**")
+        troponin = st.number_input("Troponin", value=0.01, format="%.3f")
+        creatinine = st.number_input("Creatinine", value=0.9, format="%.2f")
+        glucose = st.number_input("Glucose", value=95)
+        
+        symptoms_input = st.text_area("Symptoms (comma-separated)", "mild fatigue")
+        
+        if st.button("📊 Analyze Patient", type="primary", use_container_width=True):
+            from diagnostic_ai.data.patient_simulator import PatientRecord
+            
+            patient = PatientRecord(
+                patient_id=patient_id,
+                name=f"Patient {patient_id}",
+                age=age,
+                vitals={"hr": hr, "bp": f"{bp_sys}/{bp_dia}", "temp": temp, "o2": o2, "rr": rr},
+                recent_labs={"troponin": troponin, "creatinine": creatinine, "glucose": glucose},
+                symptoms=[s.strip() for s in symptoms_input.split(",")],
+                medical_history=["hypertension", "diabetes"],
+                current_medications=["lisinopril", "metformin"],
+                last_visit=datetime.now()
+            )
+            st.session_state.patient = patient
+            st.session_state.analysis_complete = False
+            st.success("Patient data loaded!")
+            st.rerun()
+    
+    st.markdown("---")
+    st.markdown("### 🔧 Settings")
+    show_audit = st.checkbox("Show Audit Trail", value=False)
+    show_raw = st.checkbox("Show Raw Analysis", value=False)
+
+# Main content
+st.markdown('<p class="main-header">🏥 Diagnostic AI Agent</p>', unsafe_allow_html=True)
+st.markdown("**Proactive Clinical Diagnostics with AI** | Real-time risk assessment and alert generation")
+
+# Check if patient exists
+if 'patient' not in st.session_state:
+    st.info("👈 Please generate or enter patient data in the sidebar to begin analysis.")
+    st.stop()
+
+patient = st.session_state.patient
+
+# Display patient overview
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Patient ID", patient.patient_id)
+with col2:
+    st.metric("Age", f"{patient.age} years")
+with col3:
+    st.metric("Heart Rate", f"{patient.vitals['hr']} bpm")
+with col4:
+    st.metric("O2 Saturation", f"{patient.vitals['o2']}%")
+
+# Analysis button
+if not st.session_state.analysis_complete:
+    if st.button("🔍 Run Diagnostic Analysis", type="primary", use_container_width=True):
+        with st.spinner("Analyzing patient data..."):
+            # Initialize RAG
+            initialize_rag()
+            
+            # Prepare patient context
+            patient_context = PatientDataSimulator.patient_to_context(patient)
+            
+            # Initialize workflow
+            initial_state = initialize_diagnostic_workflow(patient_context)
+            
+            # Run analysis
+            final_state = diagnostic_graph.invoke(initial_state)
+            
+            # Store results
+            st.session_state.final_state = final_state
+            st.session_state.analysis_complete = True
+            st.rerun()
+
+# Display results if analysis complete
+if st.session_state.analysis_complete and st.session_state.final_state:
+    final_state = st.session_state.final_state
+    
+    st.markdown("---")
+    st.markdown("## 📊 Analysis Results")
+    
+    # Alerts section
+    if final_state.get("alerts"):
+        st.markdown("### ⚠️ Clinical Alerts")
+        for i, alert in enumerate(final_state["alerts"]):
+            # Determine severity from alert content
+            if "HIGH" in alert.upper() or "URGENT" in alert.upper():
+                alert_class = "alert-high"
+                severity = "🔴 HIGH PRIORITY"
+            elif "MODERATE" in alert.upper():
+                alert_class = "alert-moderate"
+                severity = "🟡 MODERATE"
+            else:
+                alert_class = "alert-low"
+                severity = "🔵 LOW"
+            
+            st.markdown(f'<div class="alert-box {alert_class}">', unsafe_allow_html=True)
+            st.markdown(f"**{severity}**")
+            st.markdown(alert)
+            st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.success("✅ No high-risk alerts detected. Patient within normal parameters.")
+    
+    # Risk Assessment
+    st.markdown("### 📈 Risk Assessment")
+    risk_assessment = final_state.get("risk_assessment", {})
+    
+    if risk_assessment:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown("**AI Assessment:**")
+            assessment_text = risk_assessment.get("assessment", "No assessment available")
+            st.info(assessment_text)
+        
+        with col2:
+            st.markdown("**Timestamp:**")
+            st.text(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
+    # Detailed Analysis
+    with st.expander("🔬 Detailed Analysis Steps", expanded=False):
+        messages = final_state.get("messages", [])
+        for i, msg in enumerate(messages):
+            st.markdown(f"**Step {i+1}:** {msg.get('role', 'agent')}")
+            st.code(msg.get('content', 'No content'), language="text")
+    
+    # Patient Data Summary
+    with st.expander("📋 Patient Data Summary", expanded=False):
+        st.markdown("**Vitals:**")
+        vitals_df = {
+            "Metric": ["Heart Rate", "Blood Pressure", "Temperature", "O2 Sat", "Resp Rate"],
+            "Value": [
+                f"{patient.vitals['hr']} bpm",
+                patient.vitals['bp'],
+                f"{patient.vitals['temp']}°F",
+                f"{patient.vitals['o2']}%",
+                f"{patient.vitals['rr']}/min"
+            ]
+        }
+        st.table(vitals_df)
+        
+        st.markdown("**Lab Values:**")
+        labs_df = {
+            "Test": list(patient.recent_labs.keys()),
+            "Result": list(patient.recent_labs.values())
+        }
+        st.table(labs_df)
+        
+        st.markdown("**Symptoms:**")
+        st.write(", ".join(patient.symptoms))
+    
+    # Audit Trail
+    if show_audit:
+        with st.expander("📜 Audit Trail (Compliance)", expanded=False):
+            audit_data = st.session_state.audit_logger.get_audit_trail()
+            if audit_data:
+                st.json(audit_data)
+            else:
+                st.info("No audit trail available yet.")
+    
+    # Raw output
+    if show_raw:
+        with st.expander("🔍 Raw Analysis Output", expanded=False):
+            st.json(final_state)
+    
+    # Action buttons
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("🔄 Analyze Another Patient", use_container_width=True):
+            st.session_state.analysis_complete = False
+            if 'patient' in st.session_state:
+                del st.session_state.patient
+            st.rerun()
+    
+    with col2:
+        # Create two columns for JSON and PDF
+        dl_col1, dl_col2 = st.columns(2)
+        
+        with dl_col1:
+            # JSON Download
+            report = {
+                "patient_id": patient.patient_id,
+                "timestamp": datetime.now().isoformat(),
+                "vitals": patient.vitals,
+                "labs": patient.recent_labs,
+                "symptoms": patient.symptoms,
+                "risk_assessment": risk_assessment,
+                "alerts": final_state.get("alerts", [])
+            }
+            st.download_button(
+                label="📥 JSON",
+                data=json.dumps(report, indent=2),
+                file_name=f"report_{patient.patient_id}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        
+        with dl_col2:
+            # PDF Download
+            pdf_buffer = generate_pdf_report(
+                patient, 
+                risk_assessment, 
+                final_state.get("alerts", []),
+                final_state
+            )
+            st.download_button(
+                label="📄 PDF",
+                data=pdf_buffer,
+                file_name=f"report_{patient.patient_id}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+    with col3:
+        st.button("🖨️ Print Report", use_container_width=True, disabled=True)
+
+# Footer
+st.markdown("---")
+st.markdown(
+    "**Diagnostic AI Agent v0.1.0** | Built with LangGraph + RAG | "
+    "⚠️ For research/demo purposes only - not for clinical use"
+)
