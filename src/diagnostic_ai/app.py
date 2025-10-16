@@ -16,7 +16,7 @@ from reportlab.lib import colors
 from reportlab.lib.units import inch
 
 import streamlit as st
-import json4
+import json
 from datetime import datetime
 from diagnostic_ai.agent.graph import diagnostic_graph, initialize_diagnostic_workflow
 from diagnostic_ai.data.patient_simulator import PatientDataSimulator
